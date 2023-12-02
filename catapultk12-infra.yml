@@ -1,0 +1,620 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CatapultK12 Infrastructure as a Code
+Parameters:
+  BucketName:
+    Description: Name for S3 Bucket
+    Type: String
+    Default: "catapult-user-messages-bucket"
+  DynamoDBTableName:
+    Description: Name for DynamoDB Table
+    Type: String
+    Default: "catapult-connect"
+  RESTAPIName:
+    Description: Name for Rest API
+    Type: String
+    Default: "catapult-connect-API"
+  APIGatewayStageName:
+    Description: Stage Name for API Gateway Deployment
+    Type: String
+    AllowedPattern: '[a-z0-9]+'
+    Default: dev
+Resources:
+  S3bucket:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Ref BucketName
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration: 
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags: 
+        - Key: Name
+          Value: !Ref AWS::StackName
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties: 
+      AttributeDefinitions: 
+        - AttributeName: "PK"
+          AttributeType: S
+        - AttributeName: "SK"
+          AttributeType: S
+      BillingMode: "PROVISIONED"
+      KeySchema: 
+        - AttributeName: "PK"
+          KeyType: "HASH"
+        - AttributeName: "SK"
+          KeyType: "RANGE"
+      ProvisionedThroughput: 
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: !Ref DynamoDBTableName
+      Tags: 
+        - Key: Name
+          Value: !Ref AWS::StackName
+  LambdaExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "LambdaExecRole-catapultk12"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonS3FullAccess"
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+  LambdaSES:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: LambdaEmailPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ses:SendEmail'
+              - 'ses:SendRawEmail'
+            Resource: "*"
+      Roles:
+        - Ref: LambdaExecRole
+  APIGatewayS3ExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "APIGatewayS3ExecRole-catapultk12"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+  APIGatewayDDBExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: "APIGatewayDDBExecRole-catapultk12"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess"
+  SendMessageLambdaAPIGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt SendMessageLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CatapultConnectRestAPI}/${APIGatewayStageName}/*
+  SendMessageLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: sendmessage
+      Role: !GetAtt LambdaExecRole.Arn
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          from boto3.dynamodb.conditions import Key, Attr
+          from datetime import datetime
+          from datetime import date
+
+          ses = boto3.client('ses')
+          dynamodb = boto3.client('dynamodb')
+          s3_client = boto3.client('s3')
+          table_name = '${DynamoDBTableName}'
+          bucket= '${BucketName}'
+          today = date.today()
+          timestamp = str(int(datetime.timestamp(datetime.now())))
+
+          def lambda_handler(event, context):
+
+              # Parse the JSON body from the request
+              try:
+                  body = json.loads(event['body'])
+                  senderId = body.get('uid')
+                  contactId = body.get('contactId')
+                  message = body.get('message')
+                  subject = body.get('subject')
+              except json.JSONDecodeError:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Bad Request - Invalid JSON')
+                  }
+
+              # Validate the presence of required parameters
+              if not message or not subject or not senderId or not contactId:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Bad Request - Missing required parameters')
+                  }
+              
+              # Send email using SES
+              try:
+                  # get recipient email from db
+                  dbresponse = dynamodb.get_item(
+                      TableName=table_name,
+                      Key={
+                          'PK': {'S': 'UCONTACT#'+senderId},
+                          'SK': {'S': 'CONTACT#'+contactId}
+                      }
+                  )
+                  
+                  recipient_email = dbresponse.get('Item', {}).get('email', {}).get('S', [])
+                  
+                  # get sender email from db
+                  dbresponse = dynamodb.get_item(
+                      TableName=table_name,
+                      Key={
+                          'PK': {'S': 'USER#'+senderId},
+                          'SK': {'S': 'USER#'+senderId}
+                      }
+                  )
+                  
+                  sender_email = dbresponse.get('Item', {}).get('email', {}).get('S', [])
+                  
+                  # Send Email
+                  response = ses.send_email(
+                      Source=sender_email,
+                      Destination={
+                          'ToAddresses': [recipient_email],
+                      },
+                      Message={
+                          'Subject': {'Data': subject},
+                          'Body': {'Text': {'Data': message}},
+                      }
+                  )
+                  mid = response['MessageId']
+                  print(f"Email sent. Message ID: {response['MessageId']}")
+                  
+                  # Put message in S3
+                  s3_object_key = f'USER#{senderId}/{today}/MSG#{mid}.txt'
+                  s3_client.put_object(Bucket=bucket, Key=s3_object_key, Body=message)
+                  print(f"Message stored in S3. Key: {s3_object_key}")
+                  
+                  # Store message metadata in DynamoDB
+                  dynamodb.put_item(
+                      TableName=table_name,
+                      Item={
+                          'PK': {'S': 'UMSG#'+senderId},
+                          'SK': {'S': 'MSG#'+mid},
+                          'recepientId': {'S': contactId},
+                          'date': {'S': str(today)},
+                          'timestamp': {'S': timestamp},
+                          'key': {'S': s3_object_key}
+                      }
+                  )
+                  print(f"Metadata stored in DynamoDB.")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Email sent successfully')
+                  }
+              
+              except ClientError as e:
+                  print(f"Error sending email: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('Internal Server Error')
+                  }
+      Description: Function to send email to contacts
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  GetMessagesAPIGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetMessagesLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${CatapultConnectRestAPI}/${APIGatewayStageName}/*
+  GetMessagesLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: getmessages
+      Role: !GetAtt LambdaExecRole.Arn
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+
+          s3 = boto3.client('s3')
+          bucket_name = '${BucketName}'
+
+          def lambda_handler(event, context):
+              user_id = event.get('queryStringParameters', {}).get('uid')
+              if not user_id:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps('Bad Request - Missing required parameters')
+                  }
+              # Fetch all messages for the given email from S3
+              try:
+                  messages = get_messages_from_s3(user_id)
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(messages)
+                  }
+              except ClientError as e:
+                  print(f"Error fetching messages from S3: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps('Internal Server Error')
+                  }
+
+          def get_messages_from_s3(id):
+              prefix = f'USER#{id}/'
+
+              # List objects in the S3 bucket for the given user
+              response = s3.list_objects_v2(
+                  Bucket=bucket_name,
+                  Prefix=prefix
+              )
+
+              # Extract message content from each S3 object
+              messages = []
+              for obj in response.get('Contents', []):
+                  print(obj)
+                  message_key = obj['Key']
+                  message_date = message_key.split('/')[1]  # Extract date from the key
+                  message_content = get_message_content_from_s3(bucket_name, message_key)
+                  messages.append({
+                      'key': message_key,
+                      'date': message_date,
+                      'content': message_content
+                  })
+
+              return messages
+
+          def get_message_content_from_s3(bucket_name, message_key):
+              # Get the content of the S3 object (message)
+              response = s3.get_object(
+                  Bucket=bucket_name,
+                  Key=message_key
+              )
+
+              # Read and return the content of the S3 object
+              content = response['Body'].read().decode('utf-8')
+              return content
+      Description: Function to get messages from S3
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  CatapultConnectRestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref RESTAPIName
+      Description: Catapult Connect Rest API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  CatapultConnectRestAPICloudwatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub CatapultConnectApiGatewayRole-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "apigateway.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs"
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  APIGatewayAccountConfig:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt CatapultConnectRestAPICloudwatchRole.Arn
+  ContactsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ParentId: !GetAtt CatapultConnectRestAPI.RootResourceId
+      PathPart: contacts
+  MessagesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ParentId: !GetAtt CatapultConnectRestAPI.RootResourceId
+      PathPart: messages
+  SendMessageResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ParentId: !Ref MessagesResource
+      PathPart: send
+  ContactIDResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ParentId: !Ref ContactsResource
+      PathPart: "{contactID}"
+  GetContactsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ResourceId: !Ref ContactsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: 200
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:dynamodb:action/Query
+        Credentials: !GetAtt APIGatewayDDBExecRole.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${DynamoDBTableName}",
+              "KeyConditionExpression": "PK = :val",
+              "ExpressionAttributeValues": {
+                ":val": {"S": "UCONTACT#$input.params('uid')"}
+              }
+            }
+      OperationName: ListContacts
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+  GetContactIDMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ResourceId: !Ref ContactIDResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: 200
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:dynamodb:action/GetItem
+        Credentials: !GetAtt APIGatewayDDBExecRole.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${DynamoDBTableName}",
+              "Key": {
+                  "PK": {
+                      "S": "UCONTACT#$input.params('uid')"
+                  },
+                  "SK": {
+                      "S": "CONTACT#$input.params('contactID')"
+                  }
+              }
+            }
+      OperationName: GetContact
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+  PatchContactIDMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ResourceId: !Ref ContactIDResource
+      HttpMethod: PATCH
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: 200
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:dynamodb:action/UpdateItem
+        Credentials: !GetAtt APIGatewayDDBExecRole.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${DynamoDBTableName}",
+              "Key": {
+                  "PK": {
+                      "S": "UCONTACT#$input.params('uid')"
+                  },
+                  "SK": {
+                      "S": "CONTACT#$input.params('contactID')"
+                  }
+              },
+              "UpdateExpression": "SET username = :val1, email = :val2, phone = :val3",
+              "ExpressionAttributeValues": {
+                  ":val1": {
+                      "S": "$input.path('$.username')"
+                  },
+                  ":val2": {
+                      "S": "$input.path('$.email')"
+                  },
+                  ":val3": {
+                      "S": "$input.path('$.phone')"
+                  }
+              }
+            }
+      OperationName: UpdateContact
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+  PutContactIDMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ResourceId: !Ref ContactIDResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: 200
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:dynamodb:action/PutItem
+        Credentials: !GetAtt APIGatewayDDBExecRole.Arn
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "TableName": "${DynamoDBTableName}",
+              "Item": {
+                  "PK": {
+                      "S": "UCONTACT#$input.params('uid')"
+                  },
+                  "SK": {
+                      "S": "CONTACT#$input.params('contactID')"
+                  },
+                  "username": {
+                      "S": "$input.path('$.username')"
+                  },
+                  "email": {
+                      "S": "$input.path('$.email')"
+                  },
+                  "phone": {
+                      "S": "$input.path('$.phone')"
+                  }
+              },
+              "ConditionExpression": "attribute_exists(PK) AND attribute_exists(SK)"
+            }
+      OperationName: PutContact
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+  GetmessagesMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ResourceId: !Ref MessagesResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetMessagesLambdaFunction.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+      OperationName: GetMessages
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+  SendmessageMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      ResourceId: !Ref SendMessageResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageLambdaFunction.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+      OperationName: SendMessage
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+  DevStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+      StageName: !Ref APIGatewayStageName
+      DeploymentId: !Ref CatapultConnectAPIDeployment
+      Description: "Development Stage"
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+      AccessLogSetting:
+        DestinationArn: !GetAtt APIGatewayAccessLogGroup.Arn
+        Format: "{\"requestId\":\"$context.requestId\",\"ip\":\"$context.identity.sourceIp\",\"caller\":\"$context.identity.caller\",\"user\":\"$context.identity.user\",\"requestTime\":\"$context.requestTime\",\"httpMethod\":\"$context.httpMethod\",\"resourcePath\":\"$context.resourcePath\",\"status\":\"$context.status\",\"protocol\":\"$context.protocol\",\"responseLength\":\"$context.responseLength\"}"
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  APIGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "APIGateway-${CatapultConnectRestAPI}-Execution-Logs"
+      RetentionInDays: 30
+  CatapultConnectAPIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetContactsMethod
+      - GetContactIDMethod
+      - PatchContactIDMethod
+      - PutContactIDMethod
+      - GetmessagesMethod
+      - SendmessageMethod
+    Properties:
+      RestApiId: !Ref CatapultConnectRestAPI
+Outputs:
+  CatapultConnectRestAPIURL:
+    Description: "Catapult Connect Rest API URL"
+    Value: !Sub "https://${CatapultConnectRestAPI}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStageName}"
